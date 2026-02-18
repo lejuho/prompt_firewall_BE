@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import base64
 import time
 import uuid
@@ -37,22 +38,31 @@ RATE_LIMIT_VERIFY = 60             # 60 req/min per IP
 RATE_LIMIT_SANDBOX = 15            # 15 req/min per IP
 WINDOW_SEC = 60
 
-# In-memory buckets (single instance MVP)
+# In-memory buckets (single instance MVP; serverless에선 best-effort)
 _bucket_verify = defaultdict(deque)
 _bucket_sandbox = defaultdict(deque)
 
 # -----------------------------
-# Example public key (replace!)
+# Public key loading (ENV-based, non-fatal)
 # -----------------------------
-EXAMPLE_PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEW9xY8z5r9vL3d9f2b6b8f9c9d0e1f2
-g3h4i5j6k7l8m9n0o1p2q3r4s5t6u7v8w9x0y1z2
------END PUBLIC KEY-----"""
+# Vercel Environment Variable:
+#   PUBLIC_KEY_PEM_DEFAULT = "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+# 줄바꿈이 힘들면 \\n 로 넣고 아래에서 복원합니다.
+PUBLIC_KEYS = {}
 
-try:
-    PUBLIC_KEYS = {"default": load_pem_public_key(EXAMPLE_PUBLIC_KEY_PEM)}
-except Exception as e:
-    raise RuntimeError(f"Failed to load public key PEM: {e}")
+def _load_public_key_from_env(var_name: str):
+    raw = os.getenv(var_name, "").strip()
+    if not raw:
+        return None
+    try:
+        pem_bytes = raw.replace("\\n", "\n").encode("utf-8")
+        return load_pem_public_key(pem_bytes)
+    except Exception:
+        return None
+
+default_key = _load_public_key_from_env("PUBLIC_KEY_PEM_DEFAULT")
+if default_key is not None:
+    PUBLIC_KEYS["default"] = default_key
 
 
 # -----------------------------
@@ -71,7 +81,6 @@ def error_json(status_code: int, error: str, message: str, request_id: str) -> J
 
 
 def client_ip(request: Request) -> str:
-    # 프록시/엣지 앞단에서 X-Forwarded-For를 "신뢰할 수 있게" 세팅해줄 때만 유효
     xff = request.headers.get("x-forwarded-for")
     if xff:
         return xff.split(",")[0].strip()
@@ -100,7 +109,6 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
             return error_json(413, "payload_too_large", "Request body too large.", request_id)
 
-        # Content-Length가 없거나 거짓말일 수도 있으니, 실제 body도 한 번 더 안전 체크
         body = await request.body()
         if len(body) > MAX_BODY_BYTES:
             return error_json(413, "payload_too_large", "Request body too large.", request_id)
@@ -109,7 +117,7 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
         async def receive():
             return {"type": "http.request", "body": body, "more_body": False}
 
-        request._receive = receive  # Starlette 내부 트릭(일반적인 패턴)
+        request._receive = receive  # Starlette 내부 패턴
         return await call_next(request)
 
 
@@ -170,7 +178,12 @@ async def verify_signature(req: SignatureVerifyRequest, request: Request):
 
     public_key = PUBLIC_KEYS.get(req.public_key_id)
     if not public_key:
-        return error_json(400, "bad_request", "Unknown public_key_id.", request_id)
+        return error_json(
+            503,
+            "not_configured",
+            "Public key is not configured (set PUBLIC_KEY_PEM_DEFAULT env var).",
+            request_id,
+        )
 
     try:
         signature_bytes = base64.b64decode(req.signature, validate=True)
@@ -234,7 +247,10 @@ async def sandbox_untrusted(req: SandboxRequest = Body(...), request: Request = 
     )
 
 
-# Optional health check
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "public_key_configured": ("default" in PUBLIC_KEYS),
+        "rate_limit_mode": "best_effort_in_memory",
+    }
