@@ -50,6 +50,9 @@ UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
+print("BOOT: has_url=", bool(UPSTASH_URL), "has_token=", bool(UPSTASH_TOKEN))
+
+
 # best-effort in-memory fallback (serverless에선 불완전)
 _mem_sessions: dict[str, Tuple[bytes, float]] = {}  # session_id -> (pem_bytes, expires_at_epoch)
 
@@ -342,8 +345,29 @@ async def sandbox_untrusted(req: SandboxRequest = Body(...), request: Request = 
 
 @app.get("/health")
 async def health():
-    return {
+    info = {
         "ok": True,
         "redis_mode": ("upstash" if USE_UPSTASH else "in_memory_best_effort"),
         "session_ttl_seconds": SESSION_TTL_SECONDS,
+        "env": {
+            "has_upstash_url": bool(UPSTASH_URL),
+            "has_upstash_token": bool(UPSTASH_TOKEN),
+        },
     }
+
+    # Optional: probe upstash connectivity (only if env present)
+    if USE_UPSTASH:
+        try:
+            key = "pfw:health_probe"
+            url = f"{UPSTASH_URL}/set/{key}/ok"
+            headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+            params = {"EX": "10"}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.post(url, headers=headers, params=params)
+                r.raise_for_status()
+            info["upstash_probe"] = {"ok": True}
+        except Exception as e:
+            info["upstash_probe"] = {"ok": False, "error": str(e)}
+
+    return info
+
