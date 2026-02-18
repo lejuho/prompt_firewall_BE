@@ -1,75 +1,74 @@
 from __future__ import annotations
 
-import base64
 import os
+import json
+import base64
 import time
 import uuid
-from collections import defaultdict, deque
-from typing import Optional, Tuple
+from typing import Optional, Dict, Any
 
 import httpx
 from fastapi import FastAPI, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.exceptions import InvalidSignature
+
 
 # -----------------------------
 # App
 # -----------------------------
 app = FastAPI(
-    title="Prompt Firewall Backend (P-256 + Session Keys)",
-    description="Trusted signature verification using ephemeral session keys and sandbox for untrusted content.",
-    version="2.0.0",
+    title="Prompt Firewall Backend (P-256 + Upstash + Replay Protection)",
+    version="2.2.0",
+    description="Ephemeral session keys + verifySignature (P-256) + sandbox for untrusted content.",
 )
 
 # -----------------------------
-# Safety knobs
+# Config
 # -----------------------------
-MAX_BODY_BYTES = 64 * 1024
-MAX_MESSAGE_LEN = 10_000
-MAX_CONTENT_LEN = 20_000
-
-RATE_LIMIT_REGISTER = 30
-RATE_LIMIT_VERIFY = 60
-RATE_LIMIT_SANDBOX = 15
-WINDOW_SEC = 60
-
-_bucket_register = defaultdict(deque)
-_bucket_verify = defaultdict(deque)
-_bucket_sandbox = defaultdict(deque)
-
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "1800"))  # 30 min default
-SESSION_KEY_PREFIX = "pfw:sess:"  # redis key prefix
-
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
-print("BOOT: has_url=", bool(UPSTASH_URL), "has_token=", bool(UPSTASH_TOKEN))
+# Session TTL (sliding) + absolute max TTL
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "1800"))          # 30m sliding
+ABSOLUTE_MAX_SECONDS = int(os.getenv("ABSOLUTE_MAX_SECONDS", "28800"))       # 8h hard cap
 
+# Nonce replay window (store nonce keys with TTL)
+NONCE_TTL_SECONDS = int(os.getenv("NONCE_TTL_SECONDS", "600"))               # 10m
 
-# best-effort in-memory fallback (serverless에선 불완전)
-_mem_sessions: dict[str, Tuple[bytes, float]] = {}  # session_id -> (pem_bytes, expires_at_epoch)
+# Signature freshness window (optional)
+MAX_SKEW_SECONDS = int(os.getenv("MAX_SKEW_SECONDS", "300"))                 # 5m: reject too old/far-future ts
 
+# Body limits
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(64 * 1024)))
+
+print(
+    "BOOT:",
+    "use_upstash=", USE_UPSTASH,
+    "has_url=", bool(UPSTASH_URL),
+    "has_token=", bool(UPSTASH_TOKEN),
+    "session_ttl=", SESSION_TTL_SECONDS,
+    "abs_max=", ABSOLUTE_MAX_SECONDS,
+    "nonce_ttl=", NONCE_TTL_SECONDS,
+)
 
 # -----------------------------
 # Helpers
 # -----------------------------
+def now_s() -> int:
+    return int(time.time())
+
 def make_request_id() -> str:
     return uuid.uuid4().hex
 
-
 def error_json(status_code: int, error: str, message: str, request_id: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": error, "message": message, "request_id": request_id},
-    )
-
+    return JSONResponse(status_code=status_code, content={"error": error, "message": message, "request_id": request_id})
 
 def client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
@@ -77,114 +76,110 @@ def client_ip(request: Request) -> str:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
+def b64decode_strict(s: str) -> bytes:
+    return base64.b64decode(s, validate=True)
 
-def allow_rate(bucket: defaultdict, key: str, limit: int, window_sec: int) -> bool:
-    now = time.time()
-    q = bucket[key]
-    while q and (now - q[0]) > window_sec:
-        q.popleft()
-    if len(q) >= limit:
-        return False
-    q.append(now)
-    return True
+def parse_iso8601_or_epoch(ts: str) -> Optional[int]:
+    """
+    Accept either:
+    - ISO8601 like 2026-02-18T10:27:29.567Z
+    - or epoch seconds as string/int
+    Return epoch seconds int if parseable.
+    """
+    if ts is None:
+        return None
+    ts = str(ts).strip()
+    if not ts:
+        return None
+    # epoch seconds
+    if ts.isdigit():
+        try:
+            return int(ts)
+        except Exception:
+            return None
+    # ISO8601 Z
+    try:
+        # very small parser to avoid extra deps
+        # expects ...Z; strip millis if present
+        if ts.endswith("Z"):
+            ts2 = ts[:-1]
+            # split date/time
+            # 2026-02-18T10:27:29.567
+            if "T" not in ts2:
+                return None
+            date_part, time_part = ts2.split("T", 1)
+            y, m, d = [int(x) for x in date_part.split("-")]
+            # remove millis
+            if "." in time_part:
+                time_part = time_part.split(".", 1)[0]
+            hh, mm, ss = [int(x) for x in time_part.split(":")]
+            # convert to epoch using time module (UTC)
+            import calendar
+            return int(calendar.timegm((y, m, d, hh, mm, ss)))
+        return None
+    except Exception:
+        return None
 
-
-def now_epoch() -> float:
-    return time.time()
-
-
-def epoch_to_iso(ts: float) -> str:
-    # 간단 ISO-ish (UTC 표기용)
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-
-
-# -----------------------------
-# Middleware: Max body size
-# -----------------------------
-class MaxBodySizeMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        request_id = make_request_id()
-
-        cl = request.headers.get("content-length")
-        if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-            return error_json(413, "payload_too_large", "Request body too large.", request_id)
-
-        body = await request.body()
-        if len(body) > MAX_BODY_BYTES:
-            return error_json(413, "payload_too_large", "Request body too large.", request_id)
-
-        async def receive():
-            return {"type": "http.request", "body": body, "more_body": False}
-
-        request._receive = receive
-        return await call_next(request)
-
-
-app.add_middleware(MaxBodySizeMiddleware)
+def build_canonical_v2(session_id: str, ts: str, nonce: str, message: str) -> bytes:
+    """
+    V2 signing format:
+      session_id: <id>
+      ts: <ts>
+      nonce: <nonce>
+      message: <message>
+    NOTE: exact bytes must match extension.
+    """
+    # Keep it dead simple and stable
+    canon = (
+        f"session_id:{session_id}\n"
+        f"ts:{ts}\n"
+        f"nonce:{nonce}\n"
+        f"message:{message}"
+    )
+    return canon.encode("utf-8")
 
 # -----------------------------
 # Upstash REST helpers
 # -----------------------------
-async def upstash_set(session_id: str, pem_bytes: bytes, ttl_sec: int) -> None:
-    # store value as base64 to avoid escaping issues
-    key = SESSION_KEY_PREFIX + session_id
-    val_b64 = base64.b64encode(pem_bytes).decode("ascii")
-
-    # Upstash REST: POST {URL}/set/{key}/{value}?EX={ttl}
-    url = f"{UPSTASH_URL}/set/{key}/{val_b64}"
+async def upstash_request(method: str, path: str, *, params: Optional[dict] = None) -> Any:
+    if not USE_UPSTASH:
+        raise RuntimeError("Upstash not configured")
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    params = {"EX": str(ttl_sec)}
+    url = f"{UPSTASH_URL}{path}"
     async with httpx.AsyncClient(timeout=5.0) as client:
-        r = await client.post(url, headers=headers, params=params)
+        r = await client.request(method, url, headers=headers, params=params)
         r.raise_for_status()
+        return r.json()
 
+async def upstash_get(key: str) -> Optional[str]:
+    data = await upstash_request("GET", f"/get/{key}")
+    return data.get("result")
 
-async def upstash_get(session_id: str) -> Optional[bytes]:
-    key = SESSION_KEY_PREFIX + session_id
-    url = f"{UPSTASH_URL}/get/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        # {"result": "<value or null>"}
-        val = data.get("result")
-        if not val:
-            return None
-        try:
-            return base64.b64decode(val.encode("ascii"))
-        except Exception:
-            return None
+async def upstash_set(key: str, value: str, ex: int, nx: bool = False) -> bool:
+    params = {"EX": str(ex)}
+    if nx:
+        params["NX"] = "1"
+    data = await upstash_request("POST", f"/set/{key}/{value}", params=params)
+    # result is usually "OK" or None
+    return data.get("result") == "OK"
 
-
-async def store_session(session_id: str, pem_bytes: bytes, ttl_sec: int) -> None:
-    if USE_UPSTASH:
-        await upstash_set(session_id, pem_bytes, ttl_sec)
-    else:
-        _mem_sessions[session_id] = (pem_bytes, now_epoch() + ttl_sec)
-
-
-async def load_session_pem(session_id: str) -> Optional[bytes]:
-    if USE_UPSTASH:
-        return await upstash_get(session_id)
-    # in-memory fallback
-    item = _mem_sessions.get(session_id)
-    if not item:
-        return None
-    pem_bytes, exp = item
-    if now_epoch() > exp:
-        _mem_sessions.pop(session_id, None)
-        return None
-    return pem_bytes
-
+async def upstash_del(key: str) -> int:
+    data = await upstash_request("POST", f"/del/{key}")
+    res = data.get("result")
+    return int(res) if res is not None else 0
 
 # -----------------------------
 # Models
 # -----------------------------
+class ErrorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    error: str
+    message: str
+    request_id: Optional[str] = None
+
 class RegisterKeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    public_key_pem: str = Field(..., description="PEM-encoded public key (SPKI).")
-
+    public_key_pem: str = Field(..., description="PEM-encoded SPKI public key (P-256). Can include literal newlines or \\n.")
 
 class RegisterKeyResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -192,182 +187,260 @@ class RegisterKeyResponse(BaseModel):
     expires_at: str
     ttl_seconds: int
 
-
 class VerifySignatureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_id: str
     message: str
-    signature: str = Field(..., description="Base64 signature (DER-encoded ECDSA).")
-    signature_format: str = Field("der", description="Only 'der' supported in this backend.")
-
+    signature: str  # base64 DER
+    signature_format: str = "der"
+    # V2 fields (required for replay protection)
+    ts: Optional[str] = None
+    nonce: Optional[str] = None
+    version: str = "v2"  # default v2
 
 class VerifyResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     is_trusted: bool
     restricted_mode: bool
     reason: str
-    safe_summary: Optional[str] = None
-
 
 class SandboxRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     content: str
 
-
 class SandboxResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    safe_to_execute: bool
+    safe_to_execute: bool = False
     summary: str
-    injection_detected: Optional[bool] = None
-    reason: Optional[str] = None
+    injection_detected: bool = False
+    reason: str = ""
 
+# -----------------------------
+# Minimal body size guard (simple)
+# -----------------------------
+@app.middleware("http")
+async def body_limit_mw(request: Request, call_next):
+    rid = make_request_id()
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        return error_json(413, "payload_too_large", "Request body too large.", rid)
+
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        return error_json(413, "payload_too_large", "Request body too large.", rid)
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    request._receive = receive  # noqa
+    return await call_next(request)
+
+# -----------------------------
+# Storage keys
+# -----------------------------
+def k_session_pub(session_id: str) -> str:
+    return f"pfw:session:{session_id}:pub"
+
+def k_session_meta(session_id: str) -> str:
+    return f"pfw:session:{session_id}:meta"
+
+def k_nonce(session_id: str, nonce: str) -> str:
+    return f"pfw:nonce:{session_id}:{nonce}"
 
 # -----------------------------
 # Routes
 # -----------------------------
 @app.post("/register-key", response_model=RegisterKeyResponse)
 async def register_key(req: RegisterKeyRequest, request: Request):
-    request_id = make_request_id()
-    ip = client_ip(request)
+    rid = make_request_id()
 
-    if not allow_rate(_bucket_register, ip, RATE_LIMIT_REGISTER, WINDOW_SEC):
-        return error_json(429, "rate_limited", "Too many requests to /register-key.", request_id)
+    pem = (req.public_key_pem or "").strip()
+    if not pem:
+        return error_json(400, "bad_request", "public_key_pem is required.", rid)
 
-    pem_str = (req.public_key_pem or "").strip()
-    if not pem_str:
-        return error_json(400, "bad_request", "public_key_pem must be non-empty.", request_id)
+    # Allow \n in env-like string
+    pem_fixed = pem.replace("\\n", "\n").encode("utf-8")
 
-    # Normalize newlines: accept \n sequences too
-    pem_str = pem_str.replace("\\n", "\n")
-    pem_bytes = pem_str.encode("utf-8")
-
-    # Validate that it's a P-256 key
+    # Validate key loads and is P-256 EC
     try:
-        pub = load_pem_public_key(pem_bytes)
-        if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
-            return error_json(400, "bad_request", "Public key must be ECDSA P-256 (secp256r1).", request_id)
+        pub = load_pem_public_key(pem_fixed)
+        if not isinstance(pub, ec.EllipticCurvePublicKey):
+            return error_json(400, "bad_request", "Public key must be EC (P-256).", rid)
+        if pub.curve.name not in ("secp256r1", "prime256v1"):
+            return error_json(400, "bad_request", f"Unsupported curve: {pub.curve.name}. Expected P-256.", rid)
     except Exception as e:
-        return error_json(400, "bad_request", f"Invalid PEM public key: {e}", request_id)
+        return error_json(400, "bad_request", f"Invalid PEM public key: {e}", rid)
+
+    if not USE_UPSTASH:
+        return error_json(503, "not_configured", "Upstash is not configured.", rid)
 
     session_id = uuid.uuid4().hex
-    await store_session(session_id, pem_bytes, SESSION_TTL_SECONDS)
+    created_at = now_s()
 
-    exp = now_epoch() + SESSION_TTL_SECONDS
+    # Store public key pem + meta
+    meta = {"created_at": created_at}
+
+    # session key TTL is sliding; start with SESSION_TTL, but absolute max is enforced by meta key
+    ttl = min(SESSION_TTL_SECONDS, ABSOLUTE_MAX_SECONDS)
+
+    ok1 = await upstash_set(k_session_pub(session_id), base64.b64encode(pem_fixed).decode("ascii"), ex=ttl, nx=True)
+    ok2 = await upstash_set(k_session_meta(session_id), json.dumps(meta), ex=ABSOLUTE_MAX_SECONDS, nx=True)
+
+    if not (ok1 and ok2):
+        # Best-effort cleanup
+        await upstash_del(k_session_pub(session_id))
+        await upstash_del(k_session_meta(session_id))
+        return error_json(500, "server_error", "Failed to create session.", rid)
+
+    expires_at_epoch = created_at + ttl
+    # just return epoch as string to keep simple; your OpenAPI can describe it
     return RegisterKeyResponse(
         session_id=session_id,
-        expires_at=epoch_to_iso(exp),
-        ttl_seconds=SESSION_TTL_SECONDS,
+        expires_at=str(expires_at_epoch),
+        ttl_seconds=ttl,
     )
-
 
 @app.post("/verify-signature", response_model=VerifyResponse)
 async def verify_signature(req: VerifySignatureRequest, request: Request):
-    request_id = make_request_id()
-    ip = client_ip(request)
+    rid = make_request_id()
 
-    if not allow_rate(_bucket_verify, ip, RATE_LIMIT_VERIFY, WINDOW_SEC):
-        return error_json(429, "rate_limited", "Too many requests to /verify-signature.", request_id)
+    if req.signature_format != "der":
+        return error_json(400, "bad_request", "Only signature_format='der' is supported.", rid)
 
-    if len(req.message) > MAX_MESSAGE_LEN:
-        return error_json(400, "bad_request", f"message too long (max {MAX_MESSAGE_LEN}).", request_id)
+    if not USE_UPSTASH:
+        return error_json(503, "not_configured", "Upstash is not configured.", rid)
 
-    if req.signature_format.lower() != "der":
-        return error_json(400, "bad_request", "Only signature_format='der' is supported.", request_id)
-
-    pem_bytes = await load_session_pem(req.session_id)
-    if not pem_bytes:
-        return error_json(401, "invalid_session", "Session not found or expired. Start a new session.", request_id)
+    # Fetch pubkey + meta
+    pub_b64 = await upstash_get(k_session_pub(req.session_id))
+    meta_json = await upstash_get(k_session_meta(req.session_id))
+    if not pub_b64 or not meta_json:
+        return error_json(401, "invalid_session", "Session not found or expired.", rid)
 
     try:
-        public_key = load_pem_public_key(pem_bytes)
+        meta = json.loads(meta_json)
+        created_at = int(meta.get("created_at", 0))
     except Exception:
-        return error_json(400, "bad_request", "Stored public key is invalid.", request_id)
+        return error_json(500, "server_error", "Corrupt session metadata.", rid)
 
-    try:
-        sig_bytes = base64.b64decode(req.signature, validate=True)
-    except Exception:
-        return error_json(400, "bad_request", "Invalid base64 in signature.", request_id)
+    # Enforce absolute max (even if pub key TTL got extended incorrectly)
+    now = now_s()
+    if created_at <= 0 or now > (created_at + ABSOLUTE_MAX_SECONDS):
+        # expire keys
+        await upstash_del(k_session_pub(req.session_id))
+        await upstash_del(k_session_meta(req.session_id))
+        return error_json(401, "invalid_session", "Session expired (absolute max).", rid)
 
-    # P-256 ECDSA verify over message bytes, SHA-256 done internally
-    msg_bytes = req.message.encode("utf-8")
+    # V2 required fields (for replay protection)
+    if (req.version or "v2") != "v2":
+        return error_json(400, "bad_request", "Only version='v2' is supported on this server.", rid)
+
+    if not req.ts or not req.nonce:
+        return error_json(400, "bad_request", "ts and nonce are required for v2 verification.", rid)
+
+    # Freshness check
+    ts_epoch = parse_iso8601_or_epoch(req.ts)
+    if ts_epoch is None:
+        return error_json(400, "bad_request", "Invalid ts format. Use ISO8601 ...Z or epoch seconds.", rid)
+
+    if abs(now - ts_epoch) > MAX_SKEW_SECONDS:
+        return error_json(401, "stale_request", "Timestamp outside allowed skew window.", rid)
+
+    # Replay protection: nonce must be unique within NONCE_TTL_SECONDS
+    nonce_key = k_nonce(req.session_id, req.nonce)
+    nonce_ok = await upstash_set(nonce_key, "1", ex=NONCE_TTL_SECONDS, nx=True)
+    if not nonce_ok:
+        return error_json(401, "replay_detected", "Nonce already used (replay detected).", rid)
+
+    # Load pubkey
     try:
-        public_key.verify(sig_bytes, msg_bytes, ec.ECDSA(hashes.SHA256()))
-    except InvalidSignature:
-        return error_json(401, "invalid_signature", "Signature verification failed.", request_id)
+        pem_fixed = base64.b64decode(pub_b64)
+        pub = load_pem_public_key(pem_fixed)
     except Exception as e:
-        return error_json(400, "bad_request", f"Verification failed: {e}", request_id)
+        return error_json(500, "server_error", f"Failed to load stored public key: {e}", rid)
+
+    # Decode signature
+    try:
+        sig_bytes = b64decode_strict(req.signature)
+    except Exception:
+        return error_json(400, "bad_request", "Invalid base64 in signature.", rid)
+
+    # Verify: signature over canonical v2 bytes (includes session_id, ts, nonce, message)
+    to_verify = build_canonical_v2(req.session_id, req.ts, req.nonce, req.message)
+    digest_ctx = hashes.Hash(hashes.SHA256())
+    digest_ctx.update(to_verify)
+    digest = digest_ctx.finalize()
+
+    try:
+        pub.verify(sig_bytes, digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    except InvalidSignature:
+        return error_json(401, "invalid_signature", "Signature verification failed.", rid)
+    except Exception as e:
+        return error_json(400, "bad_request", f"Verification failed: {e}", rid)
+
+    # Sliding TTL refresh (bounded by absolute max)
+    remaining_abs = (created_at + ABSOLUTE_MAX_SECONDS) - now
+    new_ttl = min(SESSION_TTL_SECONDS, max(1, remaining_abs))
+    # Refresh session public key TTL only; meta keeps absolute max TTL
+    # Keep same value
+    await upstash_set(k_session_pub(req.session_id), pub_b64, ex=new_ttl, nx=False)
 
     return VerifyResponse(
         is_trusted=True,
         restricted_mode=False,
-        reason="Signature valid (P-256) → Trusted session context",
+        reason="Signature valid (P-256 v2) → Trusted session context",
     )
 
-
 @app.post("/sandbox-untrusted", response_model=SandboxResponse)
-async def sandbox_untrusted(req: SandboxRequest = Body(...), request: Request = ...):
-    request_id = make_request_id()
-    ip = client_ip(request)
-
-    if not allow_rate(_bucket_sandbox, ip, RATE_LIMIT_SANDBOX, WINDOW_SEC):
-        return error_json(429, "rate_limited", "Too many requests to /sandbox-untrusted.", request_id)
-
+async def sandbox_untrusted(req: SandboxRequest, request: Request):
+    # MVP: simple pattern-based classifier; you can replace with LLM later.
     content = (req.content or "").strip()
     if not content:
-        return error_json(400, "bad_request", "content must be a non-empty string.", request_id)
+        return JSONResponse(status_code=400, content={"error": "bad_request", "message": "content must be non-empty.", "request_id": make_request_id()})
 
-    if len(content) > MAX_CONTENT_LEN:
-        content = content[:MAX_CONTENT_LEN]
-
+    lowered = content.lower()
     dangerous_patterns = [
         "ignore previous instructions",
         "system prompt",
         "forget all rules",
         "delete everything",
         "you are an ai",
+        "exfiltrate",
+        "api key",
+        "password",
+        "run this command",
     ]
-    lowered = content.lower()
-    injection_detected = any(pat in lowered for pat in dangerous_patterns)
+    inj = any(p in lowered for p in dangerous_patterns)
 
-    snippet = content[:200] + ("..." if len(content) > 200 else "")
+    snippet = content[:500] + ("..." if len(content) > 500 else "")
     summary = f"[SANDBOX SUMMARY] {snippet}"
 
     return SandboxResponse(
         safe_to_execute=False,
         summary=summary,
-        injection_detected=injection_detected,
-        reason=(
-            "Untrusted content processed in sandbox. Execution blocked."
-            + (" Potential injection detected!" if injection_detected else "")
-        ),
+        injection_detected=inj,
+        reason="Untrusted content processed in sandbox. Execution blocked."
+               + (" Potential injection detected!" if inj else "")
     )
-
 
 @app.get("/health")
 async def health():
-    info = {
+    info: Dict[str, Any] = {
         "ok": True,
         "redis_mode": ("upstash" if USE_UPSTASH else "in_memory_best_effort"),
         "session_ttl_seconds": SESSION_TTL_SECONDS,
+        "absolute_max_seconds": ABSOLUTE_MAX_SECONDS,
+        "nonce_ttl_seconds": NONCE_TTL_SECONDS,
+        "max_skew_seconds": MAX_SKEW_SECONDS,
         "env": {
             "has_upstash_url": bool(UPSTASH_URL),
             "has_upstash_token": bool(UPSTASH_TOKEN),
         },
     }
 
-    # Optional: probe upstash connectivity (only if env present)
     if USE_UPSTASH:
         try:
             key = "pfw:health_probe"
-            url = f"{UPSTASH_URL}/set/{key}/ok"
-            headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-            params = {"EX": "10"}
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.post(url, headers=headers, params=params)
-                r.raise_for_status()
-            info["upstash_probe"] = {"ok": True}
+            ok = await upstash_set(key, "ok", ex=10, nx=False)
+            info["upstash_probe"] = {"ok": bool(ok)}
         except Exception as e:
             info["upstash_probe"] = {"ok": False, "error": str(e)}
-
     return info
-
