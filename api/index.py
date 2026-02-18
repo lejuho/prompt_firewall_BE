@@ -106,41 +106,37 @@ def build_canonical_v2(session_id: str, ts: str, nonce: str, message: str) -> by
 # -----------------------------
 # Upstash REST helpers
 # -----------------------------
-def _enc(seg: str) -> str:
-    # encode everything (including ":" "/" "+" "=")
-    return urllib.parse.quote(seg, safe="")
 
-async def upstash_request(method: str, path: str, *, params: Optional[dict] = None) -> Any:
+async def upstash_pipeline(cmds: list[dict]) -> Any:
     if not USE_UPSTASH:
         raise RuntimeError("Upstash not configured")
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    url = f"{UPSTASH_URL}{path}"
+    headers = {
+        "Authorization": f"Bearer {UPSTASH_TOKEN}",
+        "Content-Type": "application/json",
+    }
     async with httpx.AsyncClient(timeout=5.0) as client:
-        r = await client.request(method, url, headers=headers, params=params)
-        # 디버깅 쉽게: Upstash가 4xx면 body까지 포함해서 에러로 올림
+        r = await client.post(f"{UPSTASH_URL}/pipeline", headers=headers, json=cmds)
         if r.status_code >= 400:
             raise RuntimeError(f"Upstash HTTP {r.status_code}: {r.text[:500]}")
         return r.json()
 
 async def upstash_get(key: str) -> Optional[str]:
-    ek = _enc(key)
-    data = await upstash_request("GET", f"/get/{ek}")
-    return data.get("result")
+    data = await upstash_pipeline([{"command": "GET", "args": [key]}])
+    # pipeline returns list of results
+    return data[0].get("result")
 
 async def upstash_set(key: str, value: str, ex: int, nx: bool = False) -> bool:
-    ek = _enc(key)
-    ev = _enc(value)  # ★ 핵심: value도 인코딩
-    params = {"EX": str(ex)}
+    args = [key, value, "EX", str(ex)]
     if nx:
-        params["NX"] = "1"
-    data = await upstash_request("POST", f"/set/{ek}/{ev}", params=params)
-    return data.get("result") == "OK"
+        args += ["NX"]
+    data = await upstash_pipeline([{"command": "SET", "args": args}])
+    return data[0].get("result") == "OK"
 
 async def upstash_del(key: str) -> int:
-    ek = _enc(key)
-    data = await upstash_request("POST", f"/del/{ek}")
-    res = data.get("result")
+    data = await upstash_pipeline([{"command": "DEL", "args": [key]}])
+    res = data[0].get("result")
     return int(res) if res is not None else 0
+
 # -----------------------------
 # Storage keys
 # -----------------------------
