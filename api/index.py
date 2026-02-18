@@ -252,7 +252,7 @@ async def register_key(req: RegisterKeyRequest, request: Request):
     meta = {"created_at": created_at}
 
     ttl = min(SESSION_TTL_SECONDS, ABSOLUTE_MAX_SECONDS)
-    pub_value = base64.b64encode(pem_fixed).decode("ascii")
+    pub_value = base64.urlsafe_b64encode(pem_fixed).decode("ascii").rstrip("=")
 
     ok1 = await upstash_set(k_session_pub(session_id), pub_value, ex=ttl, nx=True)
     ok2 = await upstash_set(k_session_meta(session_id), json.dumps(meta), ex=ABSOLUTE_MAX_SECONDS, nx=True)
@@ -313,7 +313,8 @@ async def verify_signature(req: VerifySignatureRequest, request: Request):
 
     # load pubkey
     try:
-        pem_fixed = base64.b64decode(pub_b64)
+        pad = "=" * ((4 - (len(pub_b64) % 4)) % 4)
+        pem_fixed = base64.urlsafe_b64decode(pub_b64 + pad)
         pub = load_pem_public_key(pem_fixed)
     except Exception as e:
         return error_json(500, "server_error", f"Failed to load stored public key: {e}", rid)
