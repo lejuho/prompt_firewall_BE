@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import os
 import base64
+import os
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Optional
+from typing import Optional, Tuple
 
+import httpx
 from fastapi import FastAPI, Body, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.exceptions import InvalidSignature
 
@@ -22,47 +22,36 @@ from cryptography.exceptions import InvalidSignature
 # App
 # -----------------------------
 app = FastAPI(
-    title="Secure Context Verifier (No Auth)",
-    description="Trusted signature verification + untrusted sandbox (no authentication, hardened)",
-    version="1.0.0",
+    title="Prompt Firewall Backend (P-256 + Session Keys)",
+    description="Trusted signature verification using ephemeral session keys and sandbox for untrusted content.",
+    version="2.0.0",
 )
 
 # -----------------------------
-# Safety knobs (MVP defaults)
+# Safety knobs
 # -----------------------------
-MAX_BODY_BYTES = 64 * 1024         # 64KB request body limit
-MAX_MESSAGE_LEN = 10_000           # /verify-signature message max length
-MAX_CONTENT_LEN = 20_000           # /sandbox-untrusted content max length (truncate)
+MAX_BODY_BYTES = 64 * 1024
+MAX_MESSAGE_LEN = 10_000
+MAX_CONTENT_LEN = 20_000
 
-RATE_LIMIT_VERIFY = 60             # 60 req/min per IP
-RATE_LIMIT_SANDBOX = 15            # 15 req/min per IP
+RATE_LIMIT_REGISTER = 30
+RATE_LIMIT_VERIFY = 60
+RATE_LIMIT_SANDBOX = 15
 WINDOW_SEC = 60
 
-# In-memory buckets (single instance MVP; serverless에선 best-effort)
+_bucket_register = defaultdict(deque)
 _bucket_verify = defaultdict(deque)
 _bucket_sandbox = defaultdict(deque)
 
-# -----------------------------
-# Public key loading (ENV-based, non-fatal)
-# -----------------------------
-# Vercel Environment Variable:
-#   PUBLIC_KEY_PEM_DEFAULT = "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
-# 줄바꿈이 힘들면 \\n 로 넣고 아래에서 복원합니다.
-PUBLIC_KEYS = {}
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "1800"))  # 30 min default
+SESSION_KEY_PREFIX = "pfw:sess:"  # redis key prefix
 
-def _load_public_key_from_env(var_name: str):
-    raw = os.getenv(var_name, "").strip()
-    if not raw:
-        return None
-    try:
-        pem_bytes = raw.replace("\\n", "\n").encode("utf-8")
-        return load_pem_public_key(pem_bytes)
-    except Exception:
-        return None
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
-default_key = _load_public_key_from_env("PUBLIC_KEY_PEM_DEFAULT")
-if default_key is not None:
-    PUBLIC_KEYS["default"] = default_key
+# best-effort in-memory fallback (serverless에선 불완전)
+_mem_sessions: dict[str, Tuple[bytes, float]] = {}  # session_id -> (pem_bytes, expires_at_epoch)
 
 
 # -----------------------------
@@ -72,12 +61,11 @@ def make_request_id() -> str:
     return uuid.uuid4().hex
 
 
-def error_payload(error: str, message: str, request_id: str) -> dict:
-    return {"error": error, "message": message, "request_id": request_id}
-
-
 def error_json(status_code: int, error: str, message: str, request_id: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content=error_payload(error, message, request_id))
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": error, "message": message, "request_id": request_id},
+    )
 
 
 def client_ip(request: Request) -> str:
@@ -98,6 +86,15 @@ def allow_rate(bucket: defaultdict, key: str, limit: int, window_sec: int) -> bo
     return True
 
 
+def now_epoch() -> float:
+    return time.time()
+
+
+def epoch_to_iso(ts: float) -> str:
+    # 간단 ISO-ish (UTC 표기용)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
 # -----------------------------
 # Middleware: Max body size
 # -----------------------------
@@ -113,32 +110,92 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
         if len(body) > MAX_BODY_BYTES:
             return error_json(413, "payload_too_large", "Request body too large.", request_id)
 
-        # body를 읽었으니 downstream에서 다시 읽을 수 있게 재주입
         async def receive():
             return {"type": "http.request", "body": body, "more_body": False}
 
-        request._receive = receive  # Starlette 내부 패턴
+        request._receive = receive
         return await call_next(request)
 
 
 app.add_middleware(MaxBodySizeMiddleware)
 
+# -----------------------------
+# Upstash REST helpers
+# -----------------------------
+async def upstash_set(session_id: str, pem_bytes: bytes, ttl_sec: int) -> None:
+    # store value as base64 to avoid escaping issues
+    key = SESSION_KEY_PREFIX + session_id
+    val_b64 = base64.b64encode(pem_bytes).decode("ascii")
+
+    # Upstash REST: POST {URL}/set/{key}/{value}?EX={ttl}
+    url = f"{UPSTASH_URL}/set/{key}/{val_b64}"
+    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+    params = {"EX": str(ttl_sec)}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.post(url, headers=headers, params=params)
+        r.raise_for_status()
+
+
+async def upstash_get(session_id: str) -> Optional[bytes]:
+    key = SESSION_KEY_PREFIX + session_id
+    url = f"{UPSTASH_URL}/get/{key}"
+    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        # {"result": "<value or null>"}
+        val = data.get("result")
+        if not val:
+            return None
+        try:
+            return base64.b64decode(val.encode("ascii"))
+        except Exception:
+            return None
+
+
+async def store_session(session_id: str, pem_bytes: bytes, ttl_sec: int) -> None:
+    if USE_UPSTASH:
+        await upstash_set(session_id, pem_bytes, ttl_sec)
+    else:
+        _mem_sessions[session_id] = (pem_bytes, now_epoch() + ttl_sec)
+
+
+async def load_session_pem(session_id: str) -> Optional[bytes]:
+    if USE_UPSTASH:
+        return await upstash_get(session_id)
+    # in-memory fallback
+    item = _mem_sessions.get(session_id)
+    if not item:
+        return None
+    pem_bytes, exp = item
+    if now_epoch() > exp:
+        _mem_sessions.pop(session_id, None)
+        return None
+    return pem_bytes
+
 
 # -----------------------------
-# Models (match OpenAPI)
+# Models
 # -----------------------------
-class ErrorResponse(BaseModel):
+class RegisterKeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    error: str
-    message: str
-    request_id: Optional[str] = None
+    public_key_pem: str = Field(..., description="PEM-encoded public key (SPKI).")
 
 
-class SignatureVerifyRequest(BaseModel):
+class RegisterKeyResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    session_id: str
+    expires_at: str
+    ttl_seconds: int
+
+
+class VerifySignatureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str
     message: str
-    signature: str  # base64
-    public_key_id: str = "default"
+    signature: str = Field(..., description="Base64 signature (DER-encoded ECDSA).")
+    signature_format: str = Field("der", description="Only 'der' supported in this backend.")
 
 
 class VerifyResponse(BaseModel):
@@ -165,8 +222,43 @@ class SandboxResponse(BaseModel):
 # -----------------------------
 # Routes
 # -----------------------------
+@app.post("/register-key", response_model=RegisterKeyResponse)
+async def register_key(req: RegisterKeyRequest, request: Request):
+    request_id = make_request_id()
+    ip = client_ip(request)
+
+    if not allow_rate(_bucket_register, ip, RATE_LIMIT_REGISTER, WINDOW_SEC):
+        return error_json(429, "rate_limited", "Too many requests to /register-key.", request_id)
+
+    pem_str = (req.public_key_pem or "").strip()
+    if not pem_str:
+        return error_json(400, "bad_request", "public_key_pem must be non-empty.", request_id)
+
+    # Normalize newlines: accept \n sequences too
+    pem_str = pem_str.replace("\\n", "\n")
+    pem_bytes = pem_str.encode("utf-8")
+
+    # Validate that it's a P-256 key
+    try:
+        pub = load_pem_public_key(pem_bytes)
+        if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
+            return error_json(400, "bad_request", "Public key must be ECDSA P-256 (secp256r1).", request_id)
+    except Exception as e:
+        return error_json(400, "bad_request", f"Invalid PEM public key: {e}", request_id)
+
+    session_id = uuid.uuid4().hex
+    await store_session(session_id, pem_bytes, SESSION_TTL_SECONDS)
+
+    exp = now_epoch() + SESSION_TTL_SECONDS
+    return RegisterKeyResponse(
+        session_id=session_id,
+        expires_at=epoch_to_iso(exp),
+        ttl_seconds=SESSION_TTL_SECONDS,
+    )
+
+
 @app.post("/verify-signature", response_model=VerifyResponse)
-async def verify_signature(req: SignatureVerifyRequest, request: Request):
+async def verify_signature(req: VerifySignatureRequest, request: Request):
     request_id = make_request_id()
     ip = client_ip(request)
 
@@ -176,26 +268,27 @@ async def verify_signature(req: SignatureVerifyRequest, request: Request):
     if len(req.message) > MAX_MESSAGE_LEN:
         return error_json(400, "bad_request", f"message too long (max {MAX_MESSAGE_LEN}).", request_id)
 
-    public_key = PUBLIC_KEYS.get(req.public_key_id)
-    if not public_key:
-        return error_json(
-            503,
-            "not_configured",
-            "Public key is not configured (set PUBLIC_KEY_PEM_DEFAULT env var).",
-            request_id,
-        )
+    if req.signature_format.lower() != "der":
+        return error_json(400, "bad_request", "Only signature_format='der' is supported.", request_id)
+
+    pem_bytes = await load_session_pem(req.session_id)
+    if not pem_bytes:
+        return error_json(401, "invalid_session", "Session not found or expired. Start a new session.", request_id)
 
     try:
-        signature_bytes = base64.b64decode(req.signature, validate=True)
+        public_key = load_pem_public_key(pem_bytes)
+    except Exception:
+        return error_json(400, "bad_request", "Stored public key is invalid.", request_id)
+
+    try:
+        sig_bytes = base64.b64decode(req.signature, validate=True)
     except Exception:
         return error_json(400, "bad_request", "Invalid base64 in signature.", request_id)
 
-    digest_ctx = hashes.Hash(hashes.SHA256())
-    digest_ctx.update(req.message.encode("utf-8"))
-    digest = digest_ctx.finalize()
-
+    # P-256 ECDSA verify over message bytes, SHA-256 done internally
+    msg_bytes = req.message.encode("utf-8")
     try:
-        public_key.verify(signature_bytes, digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+        public_key.verify(sig_bytes, msg_bytes, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:
         return error_json(401, "invalid_signature", "Signature verification failed.", request_id)
     except Exception as e:
@@ -204,7 +297,7 @@ async def verify_signature(req: SignatureVerifyRequest, request: Request):
     return VerifyResponse(
         is_trusted=True,
         restricted_mode=False,
-        reason="Signature valid → Trusted context",
+        reason="Signature valid (P-256) → Trusted session context",
     )
 
 
@@ -251,6 +344,6 @@ async def sandbox_untrusted(req: SandboxRequest = Body(...), request: Request = 
 async def health():
     return {
         "ok": True,
-        "public_key_configured": ("default" in PUBLIC_KEYS),
-        "rate_limit_mode": "best_effort_in_memory",
+        "redis_mode": ("upstash" if USE_UPSTASH else "in_memory_best_effort"),
+        "session_ttl_seconds": SESSION_TTL_SECONDS,
     }
